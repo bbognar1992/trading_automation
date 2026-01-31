@@ -1,15 +1,18 @@
 """
-Flask application that acts as a middleman between TradingView alerts and IBKR IB Gateway.
+FastAPI application that acts as a middleman between TradingView alerts and IBKR IB Gateway.
 Receives webhook alerts from TradingView and executes trades via Interactive Brokers.
 """
 
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder
 import logging
 import os
 from datetime import datetime
 from typing import Optional, Dict, Any
-import json
+from contextlib import asynccontextmanager
+import uvicorn
 
 # Configure logging
 logging.basicConfig(
@@ -17,8 +20,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-app = Flask(__name__)
 
 # IB Gateway connection settings (can be overridden by environment variables)
 IB_HOST = os.getenv('IB_HOST', '127.0.0.1')
@@ -59,6 +60,73 @@ def disconnect_ib():
         logger.error(f"Error disconnecting from IB Gateway: {e}")
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events."""
+    # Startup
+    logger.info("Starting FastAPI application...")
+    # Optionally connect on startup
+    # connect_ib()
+    yield
+    # Shutdown
+    logger.info("Shutting down FastAPI application...")
+    disconnect_ib()
+
+
+# Initialize FastAPI app (after lifespan is defined)
+app = FastAPI(
+    title="TradingView-IBKR Middleman",
+    description="Middleman between TradingView alerts and IBKR IB Gateway",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+
+# Pydantic models for request/response validation
+class TradingViewAlert(BaseModel):
+    """TradingView webhook alert model."""
+    action: str = Field(..., description="BUY or SELL")
+    symbol: str = Field(..., description="Stock symbol (e.g., AAPL)")
+    quantity: int = Field(..., gt=0, description="Number of shares")
+    orderType: Optional[str] = Field("MARKET", description="MARKET, LIMIT, or STOP")
+    limitPrice: Optional[float] = Field(None, description="Limit price for LIMIT orders")
+    stopPrice: Optional[float] = Field(None, description="Stop price for STOP orders")
+    exchange: Optional[str] = Field("SMART", description="Exchange (default: SMART)")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "action": "BUY",
+                "symbol": "AAPL",
+                "quantity": 100,
+                "orderType": "MARKET",
+                "exchange": "SMART"
+            }
+        }
+
+
+class HealthResponse(BaseModel):
+    """Health check response model."""
+    status: str
+    ib_connected: bool
+    timestamp: str
+
+
+class StatusResponse(BaseModel):
+    """Status response model."""
+    connected: bool
+    host: str
+    port: int
+    client_id: int
+
+
+class MessageResponse(BaseModel):
+    """Generic message response model."""
+    success: bool
+    message: Optional[str] = None
+    error: Optional[str] = None
+
+
 def parse_tradingview_alert(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Parse TradingView webhook alert data.
@@ -75,10 +143,6 @@ def parse_tradingview_alert(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
     """
     try:
-        # Handle both JSON body and form data
-        if isinstance(data, str):
-            data = json.loads(data)
-        
         action = data.get('action', '').upper()
         symbol = data.get('symbol', '').upper()
         quantity = int(data.get('quantity', 0))
@@ -184,97 +248,107 @@ def execute_trade(order_params: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
-@app.route('/health', methods=['GET'])
-def health_check():
+@app.get('/health', response_model=HealthResponse, tags=["Health"])
+async def health_check():
     """Health check endpoint."""
-    return jsonify({
+    return {
         'status': 'healthy',
         'ib_connected': ib.isConnected(),
         'timestamp': datetime.now().isoformat()
-    })
+    }
 
 
-@app.route('/webhook', methods=['POST'])
-def tradingview_webhook():
+@app.post('/webhook', tags=["Trading"])
+async def tradingview_webhook(alert: TradingViewAlert, request: Request):
     """
     Endpoint to receive TradingView webhook alerts.
     
     Accepts POST requests with order details in JSON format.
     """
     try:
-        # Get data from request
-        if request.is_json:
-            data = request.get_json()
-        else:
-            data = request.form.to_dict()
+        logger.info(f"Received TradingView alert: {alert.model_dump()}")
         
-        logger.info(f"Received TradingView alert: {data}")
+        # Convert Pydantic model to dict
+        data = alert.model_dump()
         
-        # Parse the alert
+        # Parse the alert (for validation)
         order_params = parse_tradingview_alert(data)
         if not order_params:
-            return jsonify({
-                'success': False,
-                'error': 'Failed to parse alert data'
-            }), 400
+            raise HTTPException(
+                status_code=400,
+                detail='Failed to parse alert data'
+            )
         
         # Execute the trade
         result = execute_trade(order_params)
         
         if result['success']:
-            return jsonify(result), 200
+            return result
         else:
-            return jsonify(result), 500
+            raise HTTPException(
+                status_code=500,
+                detail=result.get('error', 'Unknown error executing trade')
+            )
             
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error processing webhook: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 
-@app.route('/connect', methods=['POST'])
-def connect():
+@app.post('/connect', response_model=MessageResponse, tags=["Connection"])
+async def connect():
     """Manually connect to IB Gateway."""
     if connect_ib():
-        return jsonify({
+        return {
             'success': True,
             'message': f'Connected to IB Gateway at {IB_HOST}:{IB_PORT}'
-        }), 200
+        }
     else:
-        return jsonify({
-            'success': False,
-            'error': 'Failed to connect to IB Gateway'
-        }), 500
+        raise HTTPException(
+            status_code=500,
+            detail='Failed to connect to IB Gateway'
+        )
 
 
-@app.route('/disconnect', methods=['POST'])
-def disconnect():
+@app.post('/disconnect', response_model=MessageResponse, tags=["Connection"])
+async def disconnect():
     """Manually disconnect from IB Gateway."""
     disconnect_ib()
-    return jsonify({
+    return {
         'success': True,
         'message': 'Disconnected from IB Gateway'
-    }), 200
+    }
 
 
-@app.route('/status', methods=['GET'])
-def status():
+@app.get('/status', response_model=StatusResponse, tags=["Connection"])
+async def status():
     """Get connection status."""
-    return jsonify({
+    return {
         'connected': ib.isConnected(),
         'host': IB_HOST,
         'port': IB_PORT,
         'client_id': IB_CLIENT_ID
-    }), 200
+    }
+
+
 
 
 if __name__ == '__main__':
-    # Run Flask app
-    port = int(os.getenv('FLASK_PORT', 5000))
-    debug = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    # Run FastAPI app with uvicorn
+    port = int(os.getenv('FLASK_PORT', 8000))  # Changed default to 8000 (FastAPI convention)
+    host = os.getenv('FLASK_HOST', '0.0.0.0')
+    reload = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
     
-    logger.info(f"Starting Flask server on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=debug)
-
+    logger.info(f"Starting FastAPI server on {host}:{port}")
+    uvicorn.run(
+        "app:app",
+        host=host,
+        port=port,
+        reload=reload,
+        log_level="info"
+    )

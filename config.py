@@ -9,10 +9,10 @@ from typing import Optional
 class Config:
     """Application configuration."""
     
-    # Flask settings
-    FLASK_HOST: str = os.getenv('FLASK_HOST', '0.0.0.0')
-    FLASK_PORT: int = int(os.getenv('FLASK_PORT', 5000))
-    FLASK_DEBUG: bool = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    # FastAPI settings
+    FLASK_HOST: str = os.getenv('FLASK_HOST', '0.0.0.0')  # Kept for backward compatibility
+    FLASK_PORT: int = int(os.getenv('FLASK_PORT', 8000))  # Changed default to 8000 (FastAPI convention)
+    FLASK_DEBUG: bool = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'  # Enables auto-reload
     
     # IB Gateway/TWS settings
     IB_HOST: str = os.getenv('IB_HOST', '127.0.0.1')

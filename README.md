@@ -1,6 +1,6 @@
 # TradingView to IBKR IB Gateway Middleman
 
-A Flask application that acts as a middleman between TradingView webhook alerts and Interactive Brokers (IBKR) IB Gateway. This allows you to automatically execute trades on IBKR based on alerts from TradingView.
+A FastAPI application that acts as a middleman between TradingView webhook alerts and Interactive Brokers (IBKR) IB Gateway. This allows you to automatically execute trades on IBKR based on alerts from TradingView.
 
 ## Features
 
@@ -15,7 +15,7 @@ A Flask application that acts as a middleman between TradingView webhook alerts 
 
 1. **Interactive Brokers Account**: You need an IBKR account with API access enabled
 2. **IB Gateway or TWS**: Install and run IB Gateway or TWS on your machine
-3. **Python 3.8+**: Required to run the Flask application
+3. **Python 3.8+**: Required to run the FastAPI application
 4. **TradingView Account**: For creating alerts that send webhooks
 
 ## Installation
@@ -25,7 +25,22 @@ A Flask application that acts as a middleman between TradingView webhook alerts 
 cd /Users/bbognar/PycharmProjects/trading_automation
 ```
 
-2. Install dependencies:
+2. Create a virtual environment (recommended):
+```bash
+python3 -m venv venv
+```
+
+3. Activate the virtual environment:
+   - **macOS/Linux**:
+     ```bash
+     source venv/bin/activate
+     ```
+   - **Windows**:
+     ```bash
+     venv\Scripts\activate
+     ```
+
+4. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
@@ -62,25 +77,36 @@ You can configure the application using environment variables:
 - `IB_HOST`: IB Gateway host (default: 127.0.0.1)
 - `IB_PORT`: IB Gateway port (default: 7497)
 - `IB_CLIENT_ID`: Client ID for IB connection (default: 1)
-- `FLASK_PORT`: Flask server port (default: 5000)
-- `FLASK_DEBUG`: Enable debug mode (default: False)
+- `FLASK_PORT`: FastAPI server port (default: 8000)
+- `FLASK_DEBUG`: Enable auto-reload mode (default: False)
+- `FLASK_HOST`: Server host (default: 0.0.0.0)
 - `WEBHOOK_SECRET`: Optional secret for webhook validation
 
 ## Usage
 
 ### Starting the Server
 
+**Option 1: Using the app directly**
 ```bash
 python app.py
 ```
 
-The server will start on `http://0.0.0.0:5000` by default.
+**Option 2: Using uvicorn directly (recommended for production)**
+```bash
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+```
+
+The server will start on `http://0.0.0.0:8000` by default.
+
+**Note**: FastAPI automatically provides interactive API documentation:
+- **Swagger UI**: `http://localhost:8000/docs` - Interactive API explorer
+- **ReDoc**: `http://localhost:8000/redoc` - Alternative API documentation
 
 ### TradingView Webhook Setup
 
 In TradingView, create an alert and use the following webhook URL:
 ```
-http://your-server-ip:5000/webhook
+http://your-server-ip:8000/webhook
 ```
 
 ### Webhook Payload Format
@@ -197,7 +223,7 @@ Manually disconnect from IB Gateway.
 You can test the webhook endpoint using curl:
 
 ```bash
-curl -X POST http://localhost:5000/webhook \
+curl -X POST http://localhost:8000/webhook \
   -H "Content-Type: application/json" \
   -d '{
     "action": "BUY",
@@ -209,7 +235,7 @@ curl -X POST http://localhost:5000/webhook \
 
 ## Security Considerations
 
-1. **Network Security**: Expose the Flask server only on trusted networks or use a VPN
+1. **Network Security**: Expose the FastAPI server only on trusted networks or use a VPN
 2. **Webhook Validation**: Consider implementing webhook secret validation
 3. **Rate Limiting**: Add rate limiting to prevent abuse
 4. **Paper Trading First**: Always test with paper trading before using live trading
