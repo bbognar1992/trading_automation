@@ -3,7 +3,7 @@ FastAPI application that acts as a middleman between TradingView alerts and IBKR
 Receives webhook alerts from TradingView and executes trades via Interactive Brokers.
 """
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder
@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from config import Config
 
 # Thread pool for IB operations to avoid blocking the main event loop
 # This runs IB operations in a separate thread with its own event loop
@@ -23,15 +24,15 @@ ib_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ib_")
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# IB Gateway connection settings (can be overridden by environment variables)
-IB_HOST = os.getenv('IB_HOST', '127.0.0.1')
-IB_PORT = int(os.getenv('IB_PORT', 4002))  # 4002 for IB Gateway live, 4001 for IB Gateway paper, 7497 for TWS paper
-IB_CLIENT_ID = int(os.getenv('IB_CLIENT_ID', 1))
+# IB Gateway connection settings (from Config class)
+IB_HOST = Config.IB_HOST
+IB_PORT = Config.IB_PORT
+IB_CLIENT_ID = Config.IB_CLIENT_ID
 
 # Initialize IB connection - will be created in thread with event loop
 _ib_instance = None
@@ -133,6 +134,7 @@ class TradingViewAlert(BaseModel):
     limitPrice: Optional[float] = Field(None, description="Limit price for LIMIT orders")
     stopPrice: Optional[float] = Field(None, description="Stop price for STOP orders")
     exchange: Optional[str] = Field("SMART", description="Exchange (default: SMART)")
+    secret: Optional[str] = Field(None, description="Webhook secret for authentication (optional)")
 
     class Config:
         json_schema_extra = {
@@ -376,17 +378,52 @@ async def health_check():
 
 
 @app.post('/webhook', tags=["Trading"])
-async def tradingview_webhook(alert: TradingViewAlert, request: Request):
+async def tradingview_webhook(
+    alert: TradingViewAlert, 
+    request: Request,
+    x_webhook_secret: Optional[str] = Header(None, alias="X-Webhook-Secret")
+):
     """
     Endpoint to receive TradingView webhook alerts.
     
     Accepts POST requests with order details in JSON format.
+    
+    Webhook Secret Validation:
+    - If WEBHOOK_SECRET is configured, the request must include the secret
+    - Secret can be provided via:
+      1. X-Webhook-Secret header (recommended)
+      2. 'secret' field in the JSON body
     """
     try:
+        # Validate webhook secret if configured
+        if Config.WEBHOOK_SECRET:
+            # Check header first
+            secret = x_webhook_secret
+            
+            # If not in header, check request body
+            if not secret:
+                try:
+                    body = await request.json()
+                    secret = body.get('secret')
+                except:
+                    pass
+            
+            # Validate secret
+            if not secret or secret != Config.WEBHOOK_SECRET:
+                logger.warning(f"Invalid or missing webhook secret from {request.client.host}")
+                raise HTTPException(
+                    status_code=401,
+                    detail='Invalid or missing webhook secret'
+                )
+            logger.debug("Webhook secret validated successfully")
+        
         logger.info(f"Received TradingView alert: {alert.model_dump()}")
         
         # Convert Pydantic model to dict
         data = alert.model_dump()
+        
+        # Remove secret from data if present (don't process it as order data)
+        data.pop('secret', None)
         
         # Parse the alert (for validation)
         order_params = parse_tradingview_alert(data)
@@ -505,16 +542,12 @@ async def get_open_orders():
 
 
 if __name__ == '__main__':
-    # Run FastAPI app with uvicorn
-    port = int(os.getenv('FLASK_PORT', 8000))  # Changed default to 8000 (FastAPI convention)
-    host = os.getenv('FLASK_HOST', '0.0.0.0')
-    reload = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
-    
-    logger.info(f"Starting FastAPI server on {host}:{port}")
+    # Run FastAPI app with uvicorn (using Config class)
+    logger.info(f"Starting FastAPI server on {Config.FLASK_HOST}:{Config.FLASK_PORT}")
     uvicorn.run(
         "app:app",
-        host=host,
-        port=port,
-        reload=reload,
+        host=Config.FLASK_HOST,
+        port=Config.FLASK_PORT,
+        reload=Config.FLASK_DEBUG,
         log_level="info"
     )

@@ -205,6 +205,42 @@ https://your-ngrok-url.ngrok-free.app/webhook
 http://your-server-ip:8000/webhook
 ```
 
+### Webhook Secret (Security)
+
+To secure your webhook endpoint, you can use a webhook secret:
+
+1. **Set the secret in your environment**:
+   ```bash
+   export WEBHOOK_SECRET=your_secret_key_here
+   ```
+   Or add it to your `.env` file:
+   ```
+   WEBHOOK_SECRET=your_secret_key_here
+   ```
+
+2. **Include the secret in TradingView webhooks**:
+
+   **Option 1: Using HTTP Header (Recommended)**
+   - In TradingView alert webhook, add a custom header:
+     - Header name: `X-Webhook-Secret`
+     - Header value: `your_secret_key_here`
+
+   **Option 2: Using JSON Body**
+   - Add `"secret": "your_secret_key_here"` to your webhook JSON payload
+
+3. **Example TradingView webhook payload with secret**:
+   ```json
+   {
+     "action": "BUY",
+     "symbol": "AAPL",
+     "quantity": 100,
+     "orderType": "MARKET",
+     "secret": "your_secret_key_here"
+   }
+   ```
+
+**Note**: If `WEBHOOK_SECRET` is not set, the webhook will work without authentication. It's recommended to set a secret for production use.
+
 ### Webhook Payload Format
 
 TradingView should send a POST request with the following JSON format:
