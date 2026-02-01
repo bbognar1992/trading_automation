@@ -16,7 +16,7 @@ class Config:
     
     # IB Gateway/TWS settings
     IB_HOST: str = os.getenv('IB_HOST', '127.0.0.1')
-    IB_PORT: int = int(os.getenv('IB_PORT', 7497))  # 7497 for TWS paper, 4001 for Gateway paper
+    IB_PORT: int = int(os.getenv('IB_PORT', 4002))  # 7497 for TWS paper, 4001 for Gateway paper
     IB_CLIENT_ID: int = int(os.getenv('IB_CLIENT_ID', 1))
     
     # Security (optional webhook secret for validation)

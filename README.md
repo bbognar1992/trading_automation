@@ -11,12 +11,24 @@ A FastAPI application that acts as a middleman between TradingView webhook alert
 - RESTful API with health checks and status endpoints
 - Comprehensive logging
 
+## Quick Start (Using ngrok)
+
+1. **Install ngrok**: `brew install ngrok/ngrok/ngrok` (or download from ngrok.com)
+2. **Configure ngrok**: Get your authtoken from [ngrok dashboard](https://dashboard.ngrok.com/get-started/your-authtoken) and run `ngrok config add-authtoken YOUR_TOKEN`
+3. **Start FastAPI server**: `python app.py` (in one terminal)
+4. **Start ngrok**: `ngrok http 8000` (in another terminal)
+5. **Copy the HTTPS URL** from ngrok (e.g., `https://abc123.ngrok-free.app`)
+6. **Use in TradingView**: Set webhook URL to `https://abc123.ngrok-free.app/webhook`
+
+Or use the helper script: `./ngrok_setup.sh`
+
 ## Prerequisites
 
 1. **Interactive Brokers Account**: You need an IBKR account with API access enabled
 2. **IB Gateway or TWS**: Install and run IB Gateway or TWS on your machine
 3. **Python 3.8+**: Required to run the FastAPI application
 4. **TradingView Account**: For creating alerts that send webhooks
+5. **ngrok** (optional but recommended): For exposing your local server to the internet
 
 ## Installation
 
@@ -59,8 +71,10 @@ cp .env.example .env
    - Open IB Gateway or TWS
    - Go to Configure → API → Settings
    - Enable "Enable ActiveX and Socket Clients"
-   - Set "Socket port" (default: 7497 for paper, 7496 for live)
+   - Set "Socket port" (default: 7497 for paper, 7496 for live, 4002 for IB Gateway live)
    - Add your IP address to "Trusted IPs" (or use 127.0.0.1 for local)
+   - **IMPORTANT**: Uncheck "Read-Only API" or disable "Read-Only Mode" to allow trading
+   - Enable "Download Open Orders on Connection" (recommended)
 
 2. **Port Configuration**:
    - **Paper Trading**: 
@@ -102,9 +116,91 @@ The server will start on `http://0.0.0.0:8000` by default.
 - **Swagger UI**: `http://localhost:8000/docs` - Interactive API explorer
 - **ReDoc**: `http://localhost:8000/redoc` - Alternative API documentation
 
+### Making Your Server Publicly Accessible with ngrok
+
+Since TradingView needs to send webhooks to your server from the internet, you'll need to expose your local server. **ngrok** is a popular tool for this.
+
+#### Step 1: Install ngrok
+
+**macOS (using Homebrew)**:
+```bash
+brew install ngrok/ngrok/ngrok
+```
+
+**Or download directly**:
+1. Visit [ngrok.com](https://ngrok.com/) and sign up for a free account
+2. Download ngrok for your platform
+3. Extract and add to your PATH, or use the full path
+
+**macOS/Linux (manual)**:
+```bash
+# Download ngrok
+curl -O https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-darwin-amd64.zip
+unzip ngrok-v3-stable-darwin-amd64.zip
+sudo mv ngrok /usr/local/bin/
+```
+
+#### Step 2: Get Your ngrok Auth Token
+
+1. Sign up at [ngrok.com](https://dashboard.ngrok.com/signup) (free account)
+2. Get your authtoken from the [dashboard](https://dashboard.ngrok.com/get-started/your-authtoken)
+3. Configure ngrok:
+```bash
+ngrok config add-authtoken YOUR_AUTH_TOKEN
+```
+
+#### Step 3: Start Your FastAPI Server
+
+In one terminal, start your FastAPI server:
+```bash
+python app.py
+# or
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+#### Step 4: Start ngrok
+
+In another terminal, expose your local server:
+```bash
+ngrok http 8000
+```
+
+You'll see output like:
+```
+Forwarding  https://abc123.ngrok-free.app -> http://localhost:8000
+```
+
+**Copy the HTTPS URL** (e.g., `https://abc123.ngrok-free.app`)
+
+#### Step 5: Configure TradingView Webhook
+
+In TradingView, create an alert and use the ngrok URL:
+```
+https://abc123.ngrok-free.app/webhook
+```
+
+**Important Notes**:
+- The free ngrok URL changes each time you restart ngrok (unless you have a paid plan with a static domain)
+- Keep both your FastAPI server and ngrok running
+- The ngrok web interface is available at `http://127.0.0.1:4040` to inspect requests
+
+#### Alternative: Using ngrok with a Static Domain (Paid)
+
+If you have a paid ngrok plan, you can use a static domain:
+```bash
+ngrok http 8000 --domain=your-static-domain.ngrok-free.app
+```
+
 ### TradingView Webhook Setup
 
-In TradingView, create an alert and use the following webhook URL:
+In TradingView, create an alert and use one of the following webhook URLs:
+
+**Using ngrok (recommended for local development)**:
+```
+https://your-ngrok-url.ngrok-free.app/webhook
+```
+
+**Using a public server**:
 ```
 http://your-server-ip:8000/webhook
 ```
@@ -220,6 +316,8 @@ Manually disconnect from IB Gateway.
 
 ## Testing
 
+### Test Locally
+
 You can test the webhook endpoint using curl:
 
 ```bash
@@ -233,13 +331,40 @@ curl -X POST http://localhost:8000/webhook \
   }'
 ```
 
+### Test with ngrok
+
+Once ngrok is running, test using the public URL:
+
+```bash
+curl -X POST https://your-ngrok-url.ngrok-free.app/webhook \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "BUY",
+    "symbol": "AAPL",
+    "quantity": 1,
+    "orderType": "MARKET"
+  }'
+```
+
+**Tip**: You can also use the ngrok web interface at `http://127.0.0.1:4040` to:
+- See all incoming requests
+- Replay requests
+- Inspect request/response details
+
 ## Security Considerations
 
-1. **Network Security**: Expose the FastAPI server only on trusted networks or use a VPN
-2. **Webhook Validation**: Consider implementing webhook secret validation
+1. **Network Security**: 
+   - When using ngrok, your server is publicly accessible - anyone with the URL can send requests
+   - Consider implementing webhook secret validation (see below)
+   - Use ngrok's IP restrictions if available on your plan
+2. **Webhook Validation**: Consider implementing webhook secret validation to verify requests are from TradingView
 3. **Rate Limiting**: Add rate limiting to prevent abuse
 4. **Paper Trading First**: Always test with paper trading before using live trading
 5. **Error Handling**: Monitor logs for failed orders
+6. **ngrok Security**: 
+   - Free ngrok URLs are publicly discoverable - consider using a paid plan for better security
+   - Monitor the ngrok web interface at `http://127.0.0.1:4040` to see incoming requests
+   - Consider using ngrok's request inspection feature to verify webhook payloads
 
 ## Troubleshooting
 
