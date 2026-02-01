@@ -7,12 +7,19 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder
+from ib_insync import util
 import logging
 import os
 from datetime import datetime
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 import uvicorn
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+# Thread pool for IB operations to avoid blocking the main event loop
+# This runs IB operations in a separate thread with its own event loop
+ib_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ib_")
 
 # Configure logging
 logging.basicConfig(
@@ -23,41 +30,73 @@ logger = logging.getLogger(__name__)
 
 # IB Gateway connection settings (can be overridden by environment variables)
 IB_HOST = os.getenv('IB_HOST', '127.0.0.1')
-IB_PORT = int(os.getenv('IB_PORT', 7497))  # 7497 for TWS paper trading, 4001 for IB Gateway paper
+IB_PORT = int(os.getenv('IB_PORT', 4002))  # 4002 for IB Gateway live, 4001 for IB Gateway paper, 7497 for TWS paper
 IB_CLIENT_ID = int(os.getenv('IB_CLIENT_ID', 1))
 
-# Initialize IB connection
-ib = IB()
+# Initialize IB connection - will be created in thread with event loop
+_ib_instance = None
 
-# Global flag to track connection status
-ib_connected = False
+def _get_ib():
+    """Get or create IB instance in the current thread."""
+    global _ib_instance
+    
+    # Ensure we have an event loop in this thread
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    # Create IB instance if it doesn't exist
+    if _ib_instance is None:
+        _ib_instance = IB()
+    
+    return _ib_instance
 
 
 def connect_ib():
-    """Connect to IB Gateway/TWS."""
-    global ib_connected
+    """Connect to IB Gateway/TWS (runs in thread with event loop)."""
     try:
+        # Ensure event loop exists and is set for this thread
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Start the loop in a way that ib_insync can use it
+        # util.startLoop() starts the loop in a background thread
+        # But we're already in a thread, so we need to run the loop ourselves
+        ib = _get_ib()
         if not ib.isConnected():
-            ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
-            ib_connected = True
+            # Use ib.run() which properly handles the event loop
+            # This is the recommended way when using ib_insync in threads
+            ib.run(ib.connectAsync(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID))
             logger.info(f"Connected to IB Gateway at {IB_HOST}:{IB_PORT}")
         return True
     except Exception as e:
         logger.error(f"Failed to connect to IB Gateway: {e}")
-        ib_connected = False
         return False
 
 
 def disconnect_ib():
-    """Disconnect from IB Gateway/TWS."""
-    global ib_connected
+    """Disconnect from IB Gateway/TWS (runs in thread with event loop)."""
     try:
+        ib = _get_ib()
         if ib.isConnected():
             ib.disconnect()
-            ib_connected = False
             logger.info("Disconnected from IB Gateway")
     except Exception as e:
         logger.error(f"Error disconnecting from IB Gateway: {e}")
+
+
+def is_ib_connected():
+    """Check if IB is connected (runs in thread with event loop)."""
+    try:
+        ib = _get_ib()
+        return ib.isConnected()
+    except:
+        return False
 
 
 @asynccontextmanager
@@ -66,11 +105,13 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting FastAPI application...")
     # Optionally connect on startup
-    # connect_ib()
+    # loop = asyncio.get_event_loop()
+    # await loop.run_in_executor(ib_executor, connect_ib)
     yield
     # Shutdown
     logger.info("Shutting down FastAPI application...")
-    disconnect_ib()
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(ib_executor, disconnect_ib)
 
 
 # Initialize FastAPI app (after lifespan is defined)
@@ -180,9 +221,9 @@ def parse_tradingview_alert(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
-def execute_trade(order_params: Dict[str, Any]) -> Dict[str, Any]:
+def _execute_trade_sync(order_params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Execute a trade through IB Gateway.
+    Execute a trade through IB Gateway (synchronous, runs in thread).
     
     Args:
         order_params: Parsed order parameters from TradingView alert
@@ -190,6 +231,8 @@ def execute_trade(order_params: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Dictionary with execution result
     """
+    ib = _get_ib()
+    
     if not ib.isConnected():
         if not connect_ib():
             return {
@@ -198,10 +241,12 @@ def execute_trade(order_params: Dict[str, Any]) -> Dict[str, Any]:
             }
     
     try:
-        # Create contract
+        # Create contract - specify currency for US stocks (default to USD)
+        # For international stocks, you may need to specify different currencies
         contract = Stock(
             order_params['symbol'],
-            exchange=order_params['exchange']
+            exchange=order_params['exchange'],
+            currency='USD'  # Specify currency to avoid ambiguity
         )
         
         # Create order based on type
@@ -225,35 +270,107 @@ def execute_trade(order_params: Dict[str, Any]) -> Dict[str, Any]:
         
         # Place order
         trade = ib.placeOrder(contract, order)
-        ib.sleep(1)  # Wait for order to be submitted
+        
+        # Wait for order status update (give it time to process)
+        ib.sleep(2)  # Wait 2 seconds for order to be processed
+        
+        # Check order status - wait for it to move from PendingSubmit
+        max_wait = 5
+        waited = 0
+        while waited < max_wait and trade.orderStatus.status in ['PendingSubmit', 'PreSubmitted']:
+            ib.sleep(0.5)
+            waited += 0.5
+        
+        # Get the current order status
+        order_status = trade.orderStatus.status
+        order_id = trade.order.orderId
+        
+        # Check for order rejection or errors
+        if order_status in ['Cancelled', 'Inactive']:
+            error_msg = f"Order {order_id} was {order_status.lower()}"
+            # Check for error messages in trade log
+            if hasattr(trade, 'log') and trade.log:
+                last_log = trade.log[-1]
+                if hasattr(last_log, 'message') and last_log.message:
+                    error_msg += f": {last_log.message}"
+            logger.error(error_msg)
+            return {
+                'success': False,
+                'order_id': order_id,
+                'status': order_status,
+                'error': error_msg
+            }
+        
+        # Check if connection is still alive
+        if not ib.isConnected():
+            logger.warning("Connection lost after placing order, but order was submitted")
+            return {
+                'success': True,
+                'order_id': order_id,
+                'symbol': order_params['symbol'],
+                'action': order_params['action'],
+                'quantity': order_params['quantity'],
+                'order_type': order_params['order_type'],
+                'status': order_status,
+                'warning': 'Connection lost after submission. Please verify order status in IB Gateway.',
+                'message': f"Order {order_id} submitted (status: {order_status})"
+            }
         
         logger.info(f"Order placed: {order_params['action']} {order_params['quantity']} "
-                   f"{order_params['symbol']} ({order_params['order_type']})")
+                   f"{order_params['symbol']} ({order_params['order_type']}) - Status: {order_status}")
         
         return {
             'success': True,
-            'order_id': trade.order.orderId,
+            'order_id': order_id,
             'symbol': order_params['symbol'],
             'action': order_params['action'],
             'quantity': order_params['quantity'],
             'order_type': order_params['order_type'],
-            'status': trade.orderStatus.status,
-            'message': f"Order {trade.order.orderId} submitted successfully"
+            'status': order_status,
+            'message': f"Order {order_id} submitted successfully (status: {order_status})"
         }
     except Exception as e:
+        error_msg = str(e)
         logger.error(f"Error executing trade: {e}")
+        
+        # Check if order was already placed before the error
+        # If we get a socket disconnect but the order was submitted, it's still a success
+        if 'Broken pipe' in error_msg or 'Socket disconnect' in error_msg or 'disconnect' in error_msg.lower():
+            logger.warning("Connection lost, but order may have been submitted. Check IB Gateway for order status.")
+            return {
+                'success': True,
+                'warning': 'Connection lost after order submission. Please verify order status in IB Gateway.',
+                'error': error_msg
+            }
+        
         return {
             'success': False,
-            'error': str(e)
+            'error': error_msg
         }
+
+
+async def execute_trade(order_params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Execute a trade through IB Gateway (async wrapper).
+    
+    Args:
+        order_params: Parsed order parameters from TradingView alert
+        
+    Returns:
+        Dictionary with execution result
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(ib_executor, _execute_trade_sync, order_params)
 
 
 @app.get('/health', response_model=HealthResponse, tags=["Health"])
 async def health_check():
     """Health check endpoint."""
+    loop = asyncio.get_event_loop()
+    connected = await loop.run_in_executor(ib_executor, is_ib_connected)
     return {
         'status': 'healthy',
-        'ib_connected': ib.isConnected(),
+        'ib_connected': connected,
         'timestamp': datetime.now().isoformat()
     }
 
@@ -280,7 +397,7 @@ async def tradingview_webhook(alert: TradingViewAlert, request: Request):
             )
         
         # Execute the trade
-        result = execute_trade(order_params)
+        result = await execute_trade(order_params)
         
         if result['success']:
             return result
@@ -303,7 +420,9 @@ async def tradingview_webhook(alert: TradingViewAlert, request: Request):
 @app.post('/connect', response_model=MessageResponse, tags=["Connection"])
 async def connect():
     """Manually connect to IB Gateway."""
-    if connect_ib():
+    loop = asyncio.get_event_loop()
+    success = await loop.run_in_executor(ib_executor, connect_ib)
+    if success:
         return {
             'success': True,
             'message': f'Connected to IB Gateway at {IB_HOST}:{IB_PORT}'
@@ -318,7 +437,8 @@ async def connect():
 @app.post('/disconnect', response_model=MessageResponse, tags=["Connection"])
 async def disconnect():
     """Manually disconnect from IB Gateway."""
-    disconnect_ib()
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(ib_executor, disconnect_ib)
     return {
         'success': True,
         'message': 'Disconnected from IB Gateway'
@@ -328,11 +448,57 @@ async def disconnect():
 @app.get('/status', response_model=StatusResponse, tags=["Connection"])
 async def status():
     """Get connection status."""
+    loop = asyncio.get_event_loop()
+    connected = await loop.run_in_executor(ib_executor, is_ib_connected)
     return {
-        'connected': ib.isConnected(),
+        'connected': connected,
         'host': IB_HOST,
         'port': IB_PORT,
         'client_id': IB_CLIENT_ID
+    }
+
+
+def _get_open_orders_sync():
+    """Get all open orders (runs in thread)."""
+    try:
+        ib = _get_ib()
+        if not ib.isConnected():
+            return []
+        
+        # Request open orders
+        ib.reqAllOpenOrders()
+        ib.sleep(1)  # Wait for orders to be retrieved
+        
+        # Get open trades
+        open_trades = ib.openTrades()
+        orders = []
+        for trade in open_trades:
+            orders.append({
+                'order_id': trade.order.orderId,
+                'symbol': trade.contract.symbol,
+                'action': trade.order.action,
+                'quantity': trade.order.totalQuantity,
+                'order_type': trade.order.orderType,
+                'status': trade.orderStatus.status,
+                'filled': trade.orderStatus.filled,
+                'remaining': trade.orderStatus.remaining,
+                'avg_fill_price': trade.orderStatus.avgFillPrice
+            })
+        return orders
+    except Exception as e:
+        logger.error(f"Error getting open orders: {e}")
+        return []
+
+
+@app.get('/orders', tags=["Trading"])
+async def get_open_orders():
+    """Get all open orders from IB Gateway."""
+    loop = asyncio.get_event_loop()
+    orders = await loop.run_in_executor(ib_executor, _get_open_orders_sync)
+    return {
+        'success': True,
+        'orders': orders,
+        'count': len(orders)
     }
 
 
